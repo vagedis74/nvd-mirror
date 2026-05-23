@@ -5,6 +5,14 @@ on a 2-hour schedule via an n8n workflow. Delta sync is driven by a `last_modifi
 high-water mark — the initial backfill is one-time (~352k CVEs, ~40 min on a
 home pipe), every run after that fetches only what changed since the last one.
 
+![n8n workflow canvas](docs/workflow.png)
+
+The pump (one Code node) streams pages from NVD one at a time and batches
+each page into a single multi-row `INSERT … ON CONFLICT` against Postgres,
+so memory stays bounded irrespective of dataset size. See
+[Design notes](#design-notes) for why this replaces the more obvious
+HTTP-pagination-into-Postgres-node chain.
+
 ## Consumers
 
 - **[DockerGuard](https://github.com/vagedis74/dockerguard)** — Docker security
