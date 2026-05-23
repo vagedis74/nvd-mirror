@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Editor / OS / agents
+.idea/
+.vscode/
+.claude/
+*.swp
+.DS_Store
+
+# Local volumes (if docker-compose ever writes here instead of named volumes)
+postgres-data/
+n8n-data/
+
+# Test/scratch
+*.log
+/tmp/

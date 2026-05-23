@@ -1,0 +1,148 @@
+name: nvd-sync
+
+# Hardened stack: Postgres 16 (private) + n8n (loopback-bound, basic-auth).
+# Secrets live in .env (chmod 600). Nothing here exposes Postgres to the network.
+
+x-restart: &restart_policy
+  restart: unless-stopped
+
+x-logging: &default_logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+networks:
+  nvd-internal:
+    driver: bridge
+    internal: false   # n8n needs egress to services.nvd.nist.gov
+    ipam:
+      config:
+        - subnet: 172.30.42.0/24
+
+volumes:
+  postgres-data:
+  n8n-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nvd-postgres
+    <<: [*restart_policy, *default_logging]
+    networks: [nvd-internal]
+    # Loopback-only binding: reachable from the host for psql/pgAdmin, never from LAN.
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      # Force SCRAM-SHA-256 for new passwords (stronger than md5).
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_compression=on
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: nvd-n8n
+    <<: [*restart_policy, *default_logging]
+    networks: [nvd-internal]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Loopback-only: access n8n at http://127.0.0.1:5678 — never on a public interface.
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      # --- Auth ---
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      # --- Encryption of stored credentials ---
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # --- Networking ---
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: ${N8N_PORT}
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://${N8N_HOST}:${N8N_PORT}/
+      # --- Hardening ---
+      N8N_SECURE_COOKIE: "false"            # required when serving plain HTTP on loopback
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false" # allow workflow to read $env.NVD_API_KEY
+      # Permit the pump Code node to import the pg client (n8n already bundles pg).
+      NODE_FUNCTION_ALLOW_EXTERNAL: "pg"
+      # Bigger Node heap for the initial historical backfill (~350k CVEs).
+      NODE_OPTIONS: "--max-old-space-size=3072"
+      # The pump Code node runs for the full backfill (~30 min); default is 300s.
+      N8N_RUNNERS_TASK_TIMEOUT: "7200"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_TEMPLATES_ENABLED: "false"
+      # --- Execution data retention ---
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"        # 14 days
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      # --- Timezone ---
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      TZ: ${GENERIC_TIMEZONE}
+      # --- Surfaced to the workflow ---
+      NVD_API_KEY: ${NVD_API_KEY}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro       # import target
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          memory: 256M

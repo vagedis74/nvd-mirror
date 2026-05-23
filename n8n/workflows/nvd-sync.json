@@ -1,0 +1,147 @@
+{
+  "name": "NVD CVE Sync",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 7200,
+    "timezone": "Europe/Amsterdam"
+  },
+  "nodes": [
+    {
+      "id": "schedule-trigger",
+      "name": "Every 2 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-960, 0],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "hours", "hoursInterval": 2 }
+          ]
+        }
+      }
+    },
+    {
+      "id": "get-sync-state",
+      "name": "Get Sync State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-760, 0],
+      "credentials": {
+        "postgres": { "id": "", "name": "NVD Postgres (app)" }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sync_runs SET status='failed', error_message='timeout (sweep)', finished_at=NOW() WHERE status='running' AND started_at < NOW() - INTERVAL '2 hours'; SELECT last_mod_end_date FROM sync_state WHERE sync_type='nvd_cves';",
+        "options": {}
+      }
+    },
+    {
+      "id": "plan-window",
+      "name": "Plan Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-560, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const row = $input.first()?.json || {};\nconst lastMod = row.last_mod_end_date ? new Date(row.last_mod_end_date) : null;\n\nconst now = new Date();\nconst MAX_WINDOW_MS = 119 * 24 * 60 * 60 * 1000;\n\nlet windowStart = null;\nlet windowEnd   = null;\nlet isFirstRun  = false;\n\nif (!lastMod) {\n  isFirstRun = true;\n} else {\n  windowStart = lastMod;\n  const maxEnd = new Date(windowStart.getTime() + MAX_WINDOW_MS);\n  windowEnd = now > maxEnd ? maxEnd : now;\n}\n\nfunction nvdDate(d) { return d ? d.toISOString().replace('Z', '') : null; }\n\nreturn [{\n  json: {\n    isFirstRun,\n    windowStart:   nvdDate(windowStart),\n    windowEnd:     nvdDate(windowEnd),\n    syncStartedAt: now.toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "open-sync-run",
+      "name": "Open Sync Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-360, 0],
+      "credentials": {
+        "postgres": { "id": "", "name": "NVD Postgres (app)" }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_runs (sync_type, window_start, window_end, status) VALUES ('nvd_cves', $1::timestamptz, $2::timestamptz, 'running') RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$json.windowStart, $json.windowEnd] }}"
+        }
+      }
+    },
+    {
+      "id": "carry-plan",
+      "name": "Carry Plan",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-160, 0],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "runId",        "type": "number", "value": "={{ $json.id }}" },
+            { "id": "a2", "name": "isFirstRun",   "type": "boolean","value": "={{ $('Plan Window').first().json.isFirstRun }}" },
+            { "id": "a3", "name": "windowStart",  "type": "string", "value": "={{ $('Plan Window').first().json.windowStart || '' }}" },
+            { "id": "a4", "name": "windowEnd",    "type": "string", "value": "={{ $('Plan Window').first().json.windowEnd || '' }}" },
+            { "id": "a5", "name": "syncStartedAt","type": "string", "value": "={{ $('Plan Window').first().json.syncStartedAt }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "pump-sync",
+      "name": "Pump Sync (fetch + upsert)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Stream NVD pages and upsert one batch at a time. Memory is bounded\n// because we never hold more than one page's payload at once.\n//\n// Uses a direct pg client (allowed via NODE_FUNCTION_ALLOW_EXTERNAL=pg).\n\nconst { Client } = require('pg');\n\nconst plan   = $input.first().json;\nconst apiKey = $env.NVD_API_KEY;\nif (!apiKey) throw new Error('NVD_API_KEY env var is missing');\n\nconst PAGE_SIZE   = 2000;\nconst INTERVAL_MS = 700;             // under NVD's 50 req / 30s with-key budget\nconst MAX_RETRIES = 4;\n\nconst client = new Client({\n  host:     'postgres',\n  port:     5432,\n  database: $env.POSTGRES_DB,\n  user:     $env.POSTGRES_APP_USER,\n  password: $env.POSTGRES_APP_PASSWORD,\n});\nawait client.connect();\n\nfunction nvdDate(d) { return d ? new Date(d).toISOString().replace('Z', '') : null; }\nfunction sleep(ms)  { return new Promise(r => setTimeout(r, ms)); }\n\nfunction buildUpsert(vulns) {\n  const COLS = 13;\n  const rows = [];\n  const params = [];\n  let maxMod = null;\n  for (const v of vulns) {\n    const c = v?.cve;\n    if (!c?.id) continue;\n    const descEn = (c.descriptions || []).find(d => d.lang === 'en')?.value || null;\n    const m = c.metrics || {};\n    const v31 = m.cvssMetricV31?.[0]?.cvssData || null;\n    const v30 = m.cvssMetricV30?.[0]?.cvssData || null;\n    const v2  = m.cvssMetricV2 ?.[0]?.cvssData || null;\n    const cweIds = [];\n    for (const w of (c.weaknesses || [])) {\n      for (const d of (w.description || [])) {\n        if (d.lang === 'en' && typeof d.value === 'string' && d.value.startsWith('CWE-')) {\n          cweIds.push(d.value);\n        }\n      }\n    }\n    if (!maxMod || (c.lastModified && c.lastModified > maxMod)) maxMod = c.lastModified;\n    const b = rows.length * COLS + 1;\n    rows.push(`($${b},$${b+1},$${b+2}::timestamptz,$${b+3}::timestamptz,$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11}::text[],$${b+12}::jsonb)`);\n    params.push(\n      c.id, c.sourceIdentifier || null, c.published, c.lastModified, c.vulnStatus || null,\n      descEn,\n      v31?.baseScore ?? null, v31?.baseSeverity ?? null, v31?.vectorString ?? null,\n      v30?.baseScore ?? null, v2?.baseScore ?? null,\n      cweIds.length ? cweIds : null,\n      JSON.stringify(c),\n    );\n  }\n  if (rows.length === 0) return { sql: null, params: [], count: 0, maxMod: null };\n  const sql =\n    'INSERT INTO cves (cve_id, source_identifier, published, last_modified, vuln_status, description_en, ' +\n    'cvss_v31_score, cvss_v31_severity, cvss_v31_vector, cvss_v30_score, cvss_v2_score, cwe_ids, raw) ' +\n    'VALUES ' + rows.join(',') + ' ' +\n    'ON CONFLICT (cve_id) DO UPDATE SET ' +\n    'source_identifier = EXCLUDED.source_identifier, published = EXCLUDED.published, ' +\n    'last_modified = EXCLUDED.last_modified, vuln_status = EXCLUDED.vuln_status, ' +\n    'description_en = EXCLUDED.description_en, cvss_v31_score = EXCLUDED.cvss_v31_score, ' +\n    'cvss_v31_severity = EXCLUDED.cvss_v31_severity, cvss_v31_vector = EXCLUDED.cvss_v31_vector, ' +\n    'cvss_v30_score = EXCLUDED.cvss_v30_score, cvss_v2_score = EXCLUDED.cvss_v2_score, ' +\n    'cwe_ids = EXCLUDED.cwe_ids, raw = EXCLUDED.raw ' +\n    'WHERE cves.last_modified IS NULL OR cves.last_modified < EXCLUDED.last_modified';\n  return { sql, params, count: rows.length, maxMod };\n}\n\nlet startIndex   = 0;\nlet totalResults = null;\nlet pages        = 0;\nlet upserted     = 0;\nlet maxModified  = null;\nconst startMs    = Date.now();\n\ntry {\n  while (true) {\n    const qsParts = [\n      'resultsPerPage=' + PAGE_SIZE,\n      'startIndex=' + startIndex,\n    ];\n    if (plan.windowStart) qsParts.push('lastModStartDate=' + encodeURIComponent(plan.windowStart));\n    if (plan.windowEnd)   qsParts.push('lastModEndDate='   + encodeURIComponent(plan.windowEnd));\n    const url = 'https://services.nvd.nist.gov/rest/json/cves/2.0?' + qsParts.join('&');\n\n    let resp = null;\n    let lastErr = null;\n    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {\n      try {\n        resp = await this.helpers.httpRequest({\n          method: 'GET',\n          url,\n          headers: { apiKey, 'User-Agent': 'n8n-nvd-sync/1.0' },\n          json: true,\n          timeout: 60000,\n        });\n        break;\n      } catch (e) {\n        lastErr = e;\n        await sleep(1500 * (attempt + 1));\n      }\n    }\n    if (!resp) throw new Error('NVD fetch failed after retries: ' + (lastErr?.message || 'unknown'));\n\n    totalResults = resp.totalResults ?? 0;\n    const vulns  = resp.vulnerabilities || [];\n    if (vulns.length === 0) break;\n\n    const batch = buildUpsert(vulns);\n    if (batch.sql) {\n      await client.query(batch.sql, batch.params);\n      upserted += batch.count;\n      if (batch.maxMod && (!maxModified || batch.maxMod > maxModified)) maxModified = batch.maxMod;\n    }\n    pages++;\n\n    await client.query(\n      'UPDATE sync_runs SET pages_fetched=$1, cves_upserted=$2, total_results=$3 WHERE id=$4',\n      [pages, upserted, totalResults, plan.runId],\n    );\n\n    if (startIndex + PAGE_SIZE >= totalResults) break;\n    startIndex += PAGE_SIZE;\n    await sleep(INTERVAL_MS);\n  }\n} finally {\n  await client.end();\n}\n\nreturn [{\n  json: {\n    runId:        plan.runId,\n    pagesFetched: pages,\n    cvesUpserted: upserted,\n    totalResults,\n    newHighWater: maxModified || plan.windowEnd || plan.syncStartedAt,\n    durationMs:   Date.now() - startMs,\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "close-sync-run",
+      "name": "Close Sync Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [320, 0],
+      "credentials": {
+        "postgres": { "id": "", "name": "NVD Postgres (app)" }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sync_runs SET finished_at = NOW(), pages_fetched = $2::int, cves_upserted = $3::int, total_results = $4::int, status = 'success' WHERE id = $1::bigint;",
+        "options": {
+          "queryReplacement": "={{ [$json.runId, $json.pagesFetched, $json.cvesUpserted, $json.totalResults] }}"
+        }
+      }
+    },
+    {
+      "id": "update-sync-state",
+      "name": "Update Sync State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [520, 0],
+      "credentials": {
+        "postgres": { "id": "", "name": "NVD Postgres (app)" }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_state (sync_type, last_mod_end_date, last_sync_at, last_total_results, status, updated_at) VALUES ('nvd_cves', $1::timestamptz, NOW(), $2::int, 'success', NOW()) ON CONFLICT (sync_type) DO UPDATE SET last_mod_end_date = GREATEST(sync_state.last_mod_end_date, EXCLUDED.last_mod_end_date), last_sync_at = EXCLUDED.last_sync_at, last_total_results = EXCLUDED.last_total_results, status = EXCLUDED.status, updated_at = NOW();",
+        "options": {
+          "queryReplacement": "={{ [$('Pump Sync (fetch + upsert)').first().json.newHighWater, $('Pump Sync (fetch + upsert)').first().json.totalResults] }}"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 2 hours":              { "main": [[{ "node": "Get Sync State",            "type": "main", "index": 0 }]] },
+    "Get Sync State":             { "main": [[{ "node": "Plan Window",               "type": "main", "index": 0 }]] },
+    "Plan Window":                { "main": [[{ "node": "Open Sync Run",             "type": "main", "index": 0 }]] },
+    "Open Sync Run":              { "main": [[{ "node": "Carry Plan",                "type": "main", "index": 0 }]] },
+    "Carry Plan":                 { "main": [[{ "node": "Pump Sync (fetch + upsert)","type": "main", "index": 0 }]] },
+    "Pump Sync (fetch + upsert)": { "main": [[{ "node": "Close Sync Run",            "type": "main", "index": 0 }]] },
+    "Close Sync Run":             { "main": [[{ "node": "Update Sync State",        "type": "main", "index": 0 }]] }
+  }
+}
