@@ -5,6 +5,14 @@ on a 2-hour schedule via an n8n workflow. Delta sync is driven by a `last_modifi
 high-water mark — the initial backfill is one-time (~352k CVEs, ~40 min on a
 home pipe), every run after that fetches only what changed since the last one.
 
+## Consumers
+
+- **[DockerGuard](https://github.com/vagedis74/dockerguard)** — Docker security
+  scanner. Run with `--nvd-mirror-url postgres://nvd_app:…@host:5432/nvd`
+  (or set `NVD_MIRROR_URL` in the environment) to source CVEs from this mirror
+  instead of NVD's public API; combine with `--cpe-match` to surface CVEs that
+  OSV doesn't index for OS packages.
+
 ## Layout
 
 ```
